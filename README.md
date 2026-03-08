@@ -1,64 +1,145 @@
 # ChordLens
 
-ChordLens はローカルブラウザで動く、画像からコード進行抽出 + ローカル調性解析アプリです。
+ChordLens は MIDI ファイルから音楽構造を可視化・解析し、構造化 JSON を出力するローカル Web アプリです。
+
+「音楽構造を読むレンズ」として、MIDI から得られるノート列・ピッチ分布・調性候補などの複数レイヤーを 1 つの画面と JSON に統合します。
 
 ## 技術スタック
 
 - React + TypeScript + Vite
 - TailwindCSS
-- OpenAI互換API（画像→コード抽出のみ）
-- 調性推定ロジックは pure TypeScript（ローカル）
+- @tonejs/midi（MIDI パース）
+- Krumhansl-Schmuckler アルゴリズム（調性推定）
+- すべてローカルブラウザで完結。サーバー不要。
 
 ## セットアップ
 
 ```bash
 pnpm install
-cp .env.local.example .env.local
-# .env.local に API キーを設定
 pnpm dev
 ```
 
 ブラウザで `http://localhost:4317` を開いてください。
 
-## APIキー
+## 使い方
 
-- 必須です。
-- 優先順:
-1. UI入力欄のキー
-2. `.env.local` の `VITE_OPENAI_API_KEY`
+1. `.mid` / `.midi` ファイルをドラッグ＆ドロップ（またはクリックして選択）
+2. 自動的に解析が実行され、結果が表示されます
+3. JSON をプレビュー表示し、ダウンロード可能
 
 ## 主な機能
 
-1. 画像アップロード（Drag & Drop対応）
-2. LLMでコード抽出（JSON配列）
-3. 手動コード編集（抽出前から可能）
-4. ローカルのキー推定（24キー総当たり）
-5. Top 3候補 + 信頼度 + 内訳表示
-6. Circle of Fifths 風の SVG 可視化
+- **MIDI アップロード**: Drag & Drop 対応
+- **MIDI パース**: トラック・ノート・テンポ・拍子を構造化
+- **ピアノロール表示**: SVG ベースのノート可視化（トラック色分け、ベロシティ反映）
+- **ピッチクラスヒストグラム**: 12 音の分布を棒グラフで表示
+- **調性候補推定**: Krumhansl-Schmuckler アルゴリズムで上位 5 キーを表示
+- **Circle of Fifths**: 推定キーを五度圏上にマッピング
+- **JSON エクスポート**: 構造化された解析結果をダウンロード
 
-## キー推定ロジック（ローカル）
+## JSON スキーマ概要
 
-各キーに対して以下を合計してスコア化:
+出力 JSON は raw data と derived data を分離した構造です:
 
-- Diatonic Match Score: +3 / -1
-- Ending Resolution Score: I終止 +5, vi終止 +3
-- V→I detection: +4
-- Accidental penalty: -1
+```json
+{
+  "meta": {
+    "sourceFile": "melody.mid",
+    "ticksPerBeat": 480,
+    "tempoBpm": 120,
+    "timeSignature": "4/4",
+    "durationSeconds": 21.46
+  },
+  "tracks": [
+    {
+      "id": 0,
+      "name": "melody",
+      "notes": [
+        {
+          "pitch": 61,
+          "noteName": "C#4",
+          "pitchClass": 1,
+          "startTick": 480,
+          "durationTick": 240,
+          "startBeat": 1.0,
+          "durationBeat": 0.5,
+          "bar": 1,
+          "beatInBar": 1.0,
+          "velocity": 96,
+          "channel": 0
+        }
+      ]
+    }
+  ],
+  "analysis": {
+    "pitchClassHistogram": { "C": 0, "C#": 11, "...": "..." },
+    "range": { "lowest": "C#4", "highest": "D#5" },
+    "keyCandidates": [
+      { "key": "F# major", "score": 0.701 },
+      { "key": "A# minor", "score": 0.686 }
+    ]
+  },
+  "summary": {
+    "noteCount": 48,
+    "trackCount": 1,
+    "durationSeconds": 21.46
+  }
+}
+```
 
-上位3件を返し、上位内で正規化して confidence (0..1) を算出。
+### レイヤー構成
 
-## エッジケース
+| レイヤー | 内容 |
+|---------|------|
+| `meta` | MIDI ファイルメタデータ（テンポ、拍子、PPQ） |
+| `tracks` | トラックごとのノート列（raw data） |
+| `analysis` | 派生データ（ヒストグラム、レンジ、キー候補） |
+| `summary` | 統計情報 |
 
-- コード数が3未満: `Not enough harmonic data`
-- 平行調で拮抗する場合: `Ambiguous (parallel key)` バッジ表示
+## 調性推定アルゴリズム
 
-## Future Hook
+Krumhansl-Schmuckler アルゴリズムを使用:
+- 全ノートのピッチクラス分布を集計
+- 12 の major / 12 の minor キープロファイルとのピアソン相関係数を計算
+- 相関係数の高い上位 5 キーを候補として表示
 
-`detectModulation(progression: string[]): ModulationResult[]` を実装用プレースホルダとして定義済み。
+## アーキテクチャ
 
-## サンプル進行
+```
+src/
+├── types/
+│   ├── music.ts          # 既存の調性解析型
+│   └── midi.ts           # MIDI ドメイン型
+├── lib/
+│   ├── midiParser.ts     # MIDI パース（@tonejs/midi ラッパー）
+│   ├── midiAnalysis.ts   # 解析ロジック（pure functions）
+│   ├── keyDetection.ts   # コード進行ベースの調性推定（既存）
+│   └── chords.ts         # コード解析ユーティリティ（既存）
+├── components/
+│   ├── MidiDropzone.tsx   # MIDI ファイル入力
+│   ├── PianoRoll.tsx      # ピアノロール表示
+│   ├── PitchClassHistogram.tsx  # ピッチクラス分布
+│   ├── KeyCandidates.tsx  # 調性候補カード
+│   ├── Summary.tsx        # サマリー情報
+│   ├── JsonPanel.tsx      # JSON プレビュー & ダウンロード
+│   ├── TonalMap.tsx       # 五度圏 SVG（既存）
+│   ├── KeyCard.tsx        # キー結果カード（既存）
+│   └── ConfidenceBar.tsx  # 信頼度バー（既存）
+└── App.tsx               # メインアプリケーション
+```
 
-- `C Am F G`
-- `Am F C G`
-- `Dm G C Am`
-- `C Am Em G`（曖昧になりやすい例）
+### 設計方針
+
+- UI と解析ロジックを分離（将来の Web Worker 化を想定）
+- 解析ロジックは pure function で構成
+- raw data と derived data を JSON 上で明確に分離
+
+## 今後の拡張案
+
+- **Chord candidate suggestion**: ノート列からコード候補を自動推定
+- **Harmony analysis**: 小節ごとの和声解析
+- **AI prompt export**: LLM に渡しやすい中間表現の生成
+- **MusicXML / DAW export**: 他ツールとの連携
+- **Multi-file comparison**: 複数 MIDI の比較分析
+- **Bar-by-bar summary**: 小節ごとのサマリー表示
+- **Web Worker**: 大きな MIDI ファイルのバックグラウンド解析
