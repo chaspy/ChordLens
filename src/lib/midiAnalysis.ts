@@ -3,6 +3,7 @@ import type {
   KeyCandidateScore, PitchClassContribution, KeyBiasSignals, ScaleDegreeHistogram,
   MidiAnalysis, MidiSummary, MidiMeta,
   Histograms, BarAnalysis, ChordCandidate, ProgressionCandidate, Phrase,
+  RootMotion, PedalToneSegment, ChromaticApproachNote, StrongBeatRoots, BassAnalysis,
 } from '../types/midi'
 import { pitchToNoteName } from './midiParser'
 
@@ -681,7 +682,153 @@ export function computePhrases(
 }
 
 // ---------------------------------------------------------------------------
-// 8. Summary
+// 8. Bass analysis
+// ---------------------------------------------------------------------------
+
+/** Find the lowest-pitch note near a target beat in a bar's notes */
+function findBassRoot(
+  barNotes: MidiNote[],
+  targetBeat: number
+): { root: string; rootPitchClass: number } | null {
+  // Notes within half a beat of the target
+  const candidates = barNotes.filter((n) => Math.abs(Math.floor(n.beatInBar) - targetBeat) < 1)
+  if (candidates.length === 0) return null
+  const lowest = candidates.reduce((a, b) => (a.pitch < b.pitch ? a : b))
+  return { root: PC[lowest.pitchClass], rootPitchClass: lowest.pitchClass }
+}
+
+/** Extract beat 1 and beat 3 roots per bar */
+export function computeStrongBeatRoots(notes: MidiNote[], meta: MidiMeta): StrongBeatRoots[] {
+  if (notes.length === 0) return []
+  const maxBar = Math.max(...notes.map((n) => n.bar))
+  const results: StrongBeatRoots[] = []
+
+  for (let b = 1; b <= maxBar; b++) {
+    const barNotes = notes.filter((n) => n.bar === b)
+    const beat1 = findBassRoot(barNotes, 1)
+    const beat3 = meta.beatsPerBar >= 4 ? findBassRoot(barNotes, 3) : null
+    results.push({
+      bar: b,
+      beat1Root: beat1?.root ?? null,
+      beat1RootPitchClass: beat1?.rootPitchClass ?? null,
+      beat3Root: beat3?.root ?? null,
+      beat3RootPitchClass: beat3?.rootPitchClass ?? null,
+    })
+  }
+  return results
+}
+
+/** Compute intervals between consecutive bar roots (shortest distance ≤6 semitones) */
+export function computeRootMotionSequence(strongBeatRoots: StrongBeatRoots[]): RootMotion[] {
+  const barsWithRoots = strongBeatRoots.filter((b) => b.beat1Root !== null)
+  return barsWithRoots.map((b, idx) => {
+    const next = idx < barsWithRoots.length - 1 ? barsWithRoots[idx + 1] : null
+    let intervalToNext: number | null = null
+    let directionToNext: RootMotion['directionToNext'] = null
+
+    if (next && b.beat1RootPitchClass !== null && next.beat1RootPitchClass !== null) {
+      const raw = ((next.beat1RootPitchClass - b.beat1RootPitchClass) + 12) % 12
+      const shortest = raw <= 6 ? raw : raw - 12
+      intervalToNext = Math.abs(shortest)
+      directionToNext = shortest > 0 ? 'up' : shortest < 0 ? 'down' : 'same'
+    }
+
+    return {
+      bar: b.bar,
+      root: b.beat1Root!,
+      rootPitchClass: b.beat1RootPitchClass!,
+      intervalToNext,
+      directionToNext,
+    }
+  })
+}
+
+/** Group consecutive bars with the same root into pedal tone segments (≥2 bars) */
+export function computePedalToneSegments(rootMotion: RootMotion[]): PedalToneSegment[] {
+  if (rootMotion.length === 0) return []
+  const segments: PedalToneSegment[] = []
+  let start = 0
+
+  for (let i = 1; i <= rootMotion.length; i++) {
+    if (i === rootMotion.length || rootMotion[i].rootPitchClass !== rootMotion[start].rootPitchClass) {
+      const count = i - start
+      if (count >= 2) {
+        segments.push({
+          root: rootMotion[start].root,
+          rootPitchClass: rootMotion[start].rootPitchClass,
+          startBar: rootMotion[start].bar,
+          endBar: rootMotion[i - 1].bar,
+          barCount: count,
+        })
+      }
+      start = i
+    }
+  }
+  return segments
+}
+
+/** Find notes that approach the next bar's root by 1 semitone */
+export function computeChromaticApproachNotes(
+  notes: MidiNote[],
+  rootMotion: RootMotion[]
+): ChromaticApproachNote[] {
+  const rootByBar = new Map<number, number>()
+  for (const rm of rootMotion) rootByBar.set(rm.bar, rm.rootPitchClass)
+
+  const results: ChromaticApproachNote[] = []
+
+  for (const n of notes) {
+    // Look at the next bar's root
+    const nextBarRoot = rootByBar.get(n.bar + 1)
+    if (nextBarRoot === undefined) continue
+
+    const diff = ((n.pitchClass - nextBarRoot) + 12) % 12
+    if (diff === 1) {
+      // One semitone above the target
+      results.push({
+        noteName: n.noteName,
+        pitchClass: n.pitchClass,
+        targetRoot: PC[nextBarRoot],
+        targetRootPitchClass: nextBarRoot,
+        bar: n.bar,
+        beatInBar: n.beatInBar,
+        approachType: 'above',
+      })
+    } else if (diff === 11) {
+      // One semitone below the target
+      results.push({
+        noteName: n.noteName,
+        pitchClass: n.pitchClass,
+        targetRoot: PC[nextBarRoot],
+        targetRootPitchClass: nextBarRoot,
+        bar: n.bar,
+        beatInBar: n.beatInBar,
+        approachType: 'below',
+      })
+    }
+  }
+  return results
+}
+
+/** Compute full bass analysis for a single track */
+export function computeBassAnalysis(track: MidiTrack, meta: MidiMeta): BassAnalysis {
+  const strongBeatRoots = computeStrongBeatRoots(track.notes, meta)
+  const rootMotionSequence = computeRootMotionSequence(strongBeatRoots)
+  const pedalToneSegments = computePedalToneSegments(rootMotionSequence)
+  const chromaticApproachNotes = computeChromaticApproachNotes(track.notes, rootMotionSequence)
+
+  return {
+    trackId: track.id,
+    trackName: track.name,
+    rootMotionSequence,
+    pedalToneSegments,
+    chromaticApproachNotes,
+    strongBeatRoots,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Summary
 // ---------------------------------------------------------------------------
 
 export function computeSummary(
@@ -730,7 +877,12 @@ export function analyzeNotes(
   const bars = computeBars(allNotes, meta, tonicIdx, topMode)
   const phrases = computePhrases(allNotes)
 
-  const analysis: MidiAnalysis = { histograms, range, keyCandidates, bars, phrases }
+  // Bass analysis for bass tracks
+  const bassAnalysis: BassAnalysis[] = tracks
+    .filter((t) => t.isBass)
+    .map((t) => computeBassAnalysis(t, meta))
+
+  const analysis: MidiAnalysis = { histograms, range, keyCandidates, bars, phrases, bassAnalysis }
   const summary = computeSummary(meta, tracks, allNotes, bars, phrases)
   return { analysis, summary }
 }

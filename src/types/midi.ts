@@ -31,6 +31,10 @@ export type MidiNote = {
   isOnStrongBeat: boolean
   /** Accent weight: beat1=4, beat3=2, other=1, multiplied by velocity/127 */
   accentWeight: number
+  /** Nearest 1/16 note grid tick */
+  quantizedStartTick: number
+  /** Actual startTick minus quantizedStartTick (positive = behind grid) */
+  microTimingOffset: number
 }
 
 /** A single track's data */
@@ -38,6 +42,14 @@ export type MidiTrack = {
   id: number
   name: string
   notes: MidiNote[]
+  /** GM program number (0-127), -1 if unknown */
+  instrument: number
+  /** Human-readable instrument name */
+  instrumentName: string
+  /** Instrument family (e.g. "bass", "piano") */
+  instrumentFamily: string
+  /** Whether this track is a bass instrument */
+  isBass: boolean
 }
 
 /** Pitch class histogram (C through B) */
@@ -153,6 +165,56 @@ export type Histograms = {
   strongBeatWeighted: PitchClassHistogram
 }
 
+/** Per-bar root motion entry */
+export type RootMotion = {
+  bar: number
+  root: string
+  rootPitchClass: number
+  /** Interval in semitones to next bar's root (shortest distance, ≤6) */
+  intervalToNext: number | null
+  /** Direction to next bar's root */
+  directionToNext: 'up' | 'down' | 'same' | null
+}
+
+/** Consecutive bars sharing the same bass root */
+export type PedalToneSegment = {
+  root: string
+  rootPitchClass: number
+  startBar: number
+  endBar: number
+  barCount: number
+}
+
+/** A note approaching the next bar's root by 1 semitone */
+export type ChromaticApproachNote = {
+  noteName: string
+  pitchClass: number
+  targetRoot: string
+  targetRootPitchClass: number
+  bar: number
+  beatInBar: number
+  approachType: 'above' | 'below'
+}
+
+/** Strong beat roots per bar */
+export type StrongBeatRoots = {
+  bar: number
+  beat1Root: string | null
+  beat1RootPitchClass: number | null
+  beat3Root: string | null
+  beat3RootPitchClass: number | null
+}
+
+/** Aggregated bass analysis for a single bass track */
+export type BassAnalysis = {
+  trackId: number
+  trackName: string
+  rootMotionSequence: RootMotion[]
+  pedalToneSegments: PedalToneSegment[]
+  chromaticApproachNotes: ChromaticApproachNote[]
+  strongBeatRoots: StrongBeatRoots[]
+}
+
 /** Analysis results derived from raw data */
 export type MidiAnalysis = {
   histograms: Histograms
@@ -160,6 +222,7 @@ export type MidiAnalysis = {
   keyCandidates: KeyCandidateScore[]
   bars: BarAnalysis[]
   phrases: Phrase[]
+  bassAnalysis: BassAnalysis[]
 }
 
 /** Summary statistics */

@@ -45,6 +45,8 @@ export async function parseMidiFile(file: File): Promise<{ meta: MidiMeta; track
 
   const beatsPerBar = timeSig ? timeSig.timeSignature[0] : 4
 
+  const gridResolution = ticksPerBeat / 4 // 1/16 note grid
+
   const tracks: MidiTrack[] = midi.tracks
     .map((track, index) => {
       const notes: MidiNote[] = track.notes.map((note) => {
@@ -61,6 +63,8 @@ export async function parseMidiFile(file: File): Promise<{ meta: MidiMeta; track
         const beatWeight = beatInt === 1 ? 4 : (beatsPerBar === 4 && beatInt === 3) ? 2 : 1
         const vel = Math.round(note.velocity * 127)
         const accentWeight = round3(beatWeight * (vel / 127))
+        const quantizedStartTick = Math.round(startTick / gridResolution) * gridResolution
+        const microTimingOffset = startTick - quantizedStartTick
 
         return {
           pitch: note.midi,
@@ -78,13 +82,26 @@ export async function parseMidiFile(file: File): Promise<{ meta: MidiMeta; track
           channel: track.channel ?? 0,
           isOnStrongBeat,
           accentWeight,
+          quantizedStartTick,
+          microTimingOffset,
         }
       })
+
+      // Instrument detection from @tonejs/midi
+      const instrumentNum = track.instrument?.number ?? -1
+      const instrumentName = track.instrument?.name ?? 'unknown'
+      const instrumentFamily = track.instrument?.family ?? 'unknown'
+      const trackNameLower = (track.name || '').toLowerCase()
+      const isBass = (instrumentNum >= 32 && instrumentNum <= 39) || trackNameLower.includes('bass')
 
       return {
         id: index,
         name: track.name || `Track ${index}`,
         notes,
+        instrument: instrumentNum,
+        instrumentName,
+        instrumentFamily,
+        isBass,
       }
     })
     .filter((track) => track.notes.length > 0)

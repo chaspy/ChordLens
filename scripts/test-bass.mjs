@@ -29,19 +29,35 @@ const ppq=midi.header.ppq,bpm=midi.header.tempos[0]?.bpm??120
 const ts=midi.header.timeSignatures[0]??null
 const bpb=ts?ts.timeSignature[0]:4
 const tsStr=ts?`${ts.timeSignature[0]}/${ts.timeSignature[1]}`:'4/4'
+const gridResolution = ppq / 4 // 1/16 note grid
 
-const tracks=midi.tracks.map((t,i)=>({
-  id:i,name:t.name||`Track ${i}`,
-  notes:t.notes.map(n=>{
-    const st=Math.round(n.ticks),dt=Math.round(n.durationTicks),et=st+dt
-    const sb=st/ppq,db=dt/ppq,eb=sb+db,bar=Math.floor(sb/bpb)+1,bib=sb%bpb+1
-    const beatInt=Math.floor(bib),strong=beatInt===1||(bpb===4&&beatInt===3)
-    const vel=Math.round(n.velocity*127),bw=beatInt===1?4:(bpb===4&&beatInt===3)?2:1
-    return{pitch:n.midi,noteName:p2n(n.midi),pitchClass:n.midi%12,startTick:st,durationTick:dt,endTick:et,
-      startBeat:r3(sb),durationBeat:r3(db),endBeat:r3(eb),bar,beatInBar:r3(bib),velocity:vel,channel:t.channel??0,
-      isOnStrongBeat:strong,accentWeight:r3(bw*(vel/127))}
-  })
-})).filter(t=>t.notes.length>0)
+const tracks=midi.tracks.map((t,i)=>{
+  // Instrument detection
+  const instrumentNum = t.instrument?.number ?? -1
+  const instrumentName = t.instrument?.name ?? 'unknown'
+  const instrumentFamily = t.instrument?.family ?? 'unknown'
+  const trackNameLower = (t.name || '').toLowerCase()
+  const isBass = (instrumentNum >= 32 && instrumentNum <= 39) || trackNameLower.includes('bass')
+
+  return {
+    id:i,name:t.name||`Track ${i}`,
+    instrument: instrumentNum,
+    instrumentName,
+    instrumentFamily,
+    isBass,
+    notes:t.notes.map(n=>{
+      const st=Math.round(n.ticks),dt=Math.round(n.durationTicks),et=st+dt
+      const sb=st/ppq,db=dt/ppq,eb=sb+db,bar=Math.floor(sb/bpb)+1,bib=sb%bpb+1
+      const beatInt=Math.floor(bib),strong=beatInt===1||(bpb===4&&beatInt===3)
+      const vel=Math.round(n.velocity*127),bw=beatInt===1?4:(bpb===4&&beatInt===3)?2:1
+      const quantizedStartTick = Math.round(st / gridResolution) * gridResolution
+      const microTimingOffset = st - quantizedStartTick
+      return{pitch:n.midi,noteName:p2n(n.midi),pitchClass:n.midi%12,startTick:st,durationTick:dt,endTick:et,
+        startBeat:r3(sb),durationBeat:r3(db),endBeat:r3(eb),bar,beatInBar:r3(bib),velocity:vel,channel:t.channel??0,
+        isOnStrongBeat:strong,accentWeight:r3(bw*(vel/127)),quantizedStartTick,microTimingOffset}
+    })
+  }
+}).filter(t=>t.notes.length>0)
 
 const all=tracks.flatMap(t=>t.notes).sort((a,b)=>a.startBeat-b.startBeat)
 const maxBar=Math.max(...all.map(n=>n.bar))
@@ -53,6 +69,18 @@ const meta={sourceFile:'bass.mid',ticksPerBeat:ppq,tempoBpm:r3(bpm),timeSignatur
 console.log('=== META ===')
 console.log(`File: bass.mid | Tempo: ${meta.tempoBpm} BPM | Time Sig: ${tsStr} | PPQ: ${ppq}`)
 console.log(`Duration: ${meta.durationSeconds}s | Bars: ${maxBar} | Notes: ${all.length}`)
+
+// Instrument detection output
+console.log('\n=== INSTRUMENT DETECTION ===')
+tracks.forEach(t=>{
+  console.log(`Track ${t.id} "${t.name}": program=${t.instrument}, name=${t.instrumentName}, family=${t.instrumentFamily}, isBass=${t.isBass}`)
+})
+
+// Quantization sample
+console.log('\n=== QUANTIZATION SAMPLE (first 5 notes) ===')
+all.slice(0,5).forEach(n=>{
+  console.log(`  ${n.noteName} tick=${n.startTick} quantized=${n.quantizedStartTick} offset=${n.microTimingOffset}`)
+})
 
 // Per-bar analysis
 console.log('\n=== PER-BAR BASS NOTES ===')
@@ -69,7 +97,7 @@ for(let b=1;b<=maxBar;b++){
   barData.push({bar:b,noteCount:bn.length,pcs,notes,root:root?{name:root.noteName,pc:PC[root.pitchClass]}:null})
   if(bn.length>0){
     const noteStr=notes.map(n=>`${n.name}(b${n.beat.toFixed(1)},d${n.dur.toFixed(2)})`).join(' ')
-    console.log(`Bar ${b}: root=${root?root.name:'-'} | PCs=[${pcs.join(',')}] | ${noteStr}`)
+    console.log(`Bar ${b}: root=${root?root.noteName:'-'} | PCs=[${pcs.join(',')}] | ${noteStr}`)
   }
 }
 
@@ -163,8 +191,116 @@ for(let i=1;i<intRoots.length;i++){
   console.log(`  ${intRoots[i-1].root} → ${intRoots[i].root}: ${Math.abs(semitones)} semitone${Math.abs(semitones)!==1?'s':''} ${dir} (bar ${intRoots[i-1].bar}→${intRoots[i].bar})`)
 }
 
+// ---------------------------------------------------------------------------
+// Bass Analysis (mirrors TS implementation)
+// ---------------------------------------------------------------------------
+
+function findBassRootForBeat(barNotes, targetBeat) {
+  const candidates = barNotes.filter(n => Math.abs(Math.floor(n.beatInBar) - targetBeat) < 1)
+  if (candidates.length === 0) return null
+  const lowest = candidates.reduce((a, b) => a.pitch < b.pitch ? a : b)
+  return { root: PC[lowest.pitchClass], rootPitchClass: lowest.pitchClass }
+}
+
+function computeStrongBeatRootsFn(notes, beatsPerBar) {
+  if (notes.length === 0) return []
+  const maxB = Math.max(...notes.map(n => n.bar))
+  const results = []
+  for (let b = 1; b <= maxB; b++) {
+    const barNotes = notes.filter(n => n.bar === b)
+    const beat1 = findBassRootForBeat(barNotes, 1)
+    const beat3 = beatsPerBar >= 4 ? findBassRootForBeat(barNotes, 3) : null
+    results.push({
+      bar: b,
+      beat1Root: beat1?.root ?? null, beat1RootPitchClass: beat1?.rootPitchClass ?? null,
+      beat3Root: beat3?.root ?? null, beat3RootPitchClass: beat3?.rootPitchClass ?? null,
+    })
+  }
+  return results
+}
+
+function computeRootMotionSequenceFn(strongBeatRoots) {
+  const withRoots = strongBeatRoots.filter(b => b.beat1Root !== null)
+  return withRoots.map((b, idx) => {
+    const next = idx < withRoots.length - 1 ? withRoots[idx + 1] : null
+    let intervalToNext = null, directionToNext = null
+    if (next && b.beat1RootPitchClass !== null && next.beat1RootPitchClass !== null) {
+      const raw = ((next.beat1RootPitchClass - b.beat1RootPitchClass) + 12) % 12
+      const shortest = raw <= 6 ? raw : raw - 12
+      intervalToNext = Math.abs(shortest)
+      directionToNext = shortest > 0 ? 'up' : shortest < 0 ? 'down' : 'same'
+    }
+    return { bar: b.bar, root: b.beat1Root, rootPitchClass: b.beat1RootPitchClass, intervalToNext, directionToNext }
+  })
+}
+
+function computePedalToneSegmentsFn(rootMotion) {
+  if (rootMotion.length === 0) return []
+  const segments = []
+  let start = 0
+  for (let i = 1; i <= rootMotion.length; i++) {
+    if (i === rootMotion.length || rootMotion[i].rootPitchClass !== rootMotion[start].rootPitchClass) {
+      const count = i - start
+      if (count >= 2) {
+        segments.push({
+          root: rootMotion[start].root, rootPitchClass: rootMotion[start].rootPitchClass,
+          startBar: rootMotion[start].bar, endBar: rootMotion[i - 1].bar, barCount: count,
+        })
+      }
+      start = i
+    }
+  }
+  return segments
+}
+
+function computeChromaticApproachNotesFn(notes, rootMotion) {
+  const rootByBar = new Map()
+  for (const rm of rootMotion) rootByBar.set(rm.bar, rm.rootPitchClass)
+  const results = []
+  for (const n of notes) {
+    const nextBarRoot = rootByBar.get(n.bar + 1)
+    if (nextBarRoot === undefined) continue
+    const diff = ((n.pitchClass - nextBarRoot) + 12) % 12
+    if (diff === 1) {
+      results.push({ noteName: n.noteName, pitchClass: n.pitchClass, targetRoot: PC[nextBarRoot],
+        targetRootPitchClass: nextBarRoot, bar: n.bar, beatInBar: n.beatInBar, approachType: 'above' })
+    } else if (diff === 11) {
+      results.push({ noteName: n.noteName, pitchClass: n.pitchClass, targetRoot: PC[nextBarRoot],
+        targetRootPitchClass: nextBarRoot, bar: n.bar, beatInBar: n.beatInBar, approachType: 'below' })
+    }
+  }
+  return results
+}
+
+// Run bass analysis on bass tracks
+const bassTracks = tracks.filter(t => t.isBass)
+const bassAnalysis = bassTracks.map(t => {
+  const sbr = computeStrongBeatRootsFn(t.notes, bpb)
+  const rms = computeRootMotionSequenceFn(sbr)
+  const pts = computePedalToneSegmentsFn(rms)
+  const can = computeChromaticApproachNotesFn(t.notes, rms)
+  return { trackId: t.id, trackName: t.name, rootMotionSequence: rms, pedalToneSegments: pts, chromaticApproachNotes: can, strongBeatRoots: sbr }
+})
+
+console.log('\n=== BASS ANALYSIS ===')
+if (bassAnalysis.length === 0) {
+  console.log('No bass tracks detected.')
+} else {
+  for (const ba of bassAnalysis) {
+    console.log(`\nTrack ${ba.trackId} "${ba.trackName}":`)
+    console.log('  Root motion:', ba.rootMotionSequence.map(r => `${r.bar}:${r.root}(${r.intervalToNext ?? '-'}${r.directionToNext ? ' '+r.directionToNext : ''})`).join(' → '))
+    console.log('  Pedal tones:', ba.pedalToneSegments.length > 0
+      ? ba.pedalToneSegments.map(p => `${p.root} bars ${p.startBar}-${p.endBar} (${p.barCount} bars)`).join(', ')
+      : 'none')
+    console.log('  Chromatic approaches:', ba.chromaticApproachNotes.length > 0
+      ? ba.chromaticApproachNotes.map(c => `${c.noteName} → ${c.targetRoot} (bar ${c.bar}, beat ${c.beatInBar.toFixed(1)}, ${c.approachType})`).join(', ')
+      : 'none')
+  }
+}
+
 // Write JSON
-const output = {meta, barData, rootProgression: rootProg,
+const output = {meta, tracks: tracks.map(t => ({id:t.id,name:t.name,instrument:t.instrument,instrumentName:t.instrumentName,instrumentFamily:t.instrumentFamily,isBass:t.isBass,noteCount:t.notes.length})),
+  barData, rootProgression: rootProg, bassAnalysis,
   sections: {
     main: {bars:'1-10', notes: mainNotes.length, histogram: mainHist},
     interlude: {bars:'11+', notes: interludeNotes.length, histogram: interHist}
